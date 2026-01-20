@@ -1,6 +1,6 @@
 # Ralph Codes
 
-![Project Image](https://lh3.googleusercontent.com/gg-dl/ABS2GSntouVyUhGdOgF-B0pB-FKdVl_7eNpqQn762Bp8Fvd9EqLordPdJiuqsbVZoV5LKKuKDzcunKl3yfIBJDj-cqdAGTBqwZKP7YPum5LW8jyUxLrC2A-dJ0oCoh4O5xXKv7XW-d6El8mYrgu8_C1lUubxl3wj95aZi7myG3rhY1jbP52iow=s1024-rj)
+![Project Image](logo.jpg)
 
 A multi-session task runner with automatic parallelization for [OpenCode AI](https://opencode.ai).
 
