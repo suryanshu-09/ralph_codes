@@ -1,37 +1,44 @@
-# Ralph Codes
+# Ralph Wiggum
 
-![Project Image](logo.jpg)
+Multi-session task runner with automatic parallelization for OpenCode AI.
 
-A multi-session task runner with automatic parallelization for [OpenCode AI](https://opencode.ai).
+Based on the [Ralph technique](https://ghuntley.com/ralph/) by Geoff Huntley.
 
-## Packages
+## What It Does
 
-### @suryanshu-09/ralph_codes
+Breaks down complex prompts into atomic tasks and executes them in parallel using fresh sessions. Each task runs in isolation with strict boundaries to prevent context pollution.
 
-A plugin for OpenCode AI that breaks down complex prompts into atomic tasks and executes them in parallel using fresh sessions.
+## Features
 
-**Key Features:**
-- Automatic Task Decomposition
-- Smart Parallelization
-- Fresh Sessions for context isolation
-- Dependency Management
+- Automatic task decomposition
+- Parallel execution (independent tasks run simultaneously)
+- Fresh sessions for context isolation
+- Dependency management
+- State persistence (save/resume)
 - Two modes: Automatic and Orchestrated
 
-**Quick Start:**
-```bash
-npm install @suryanshu-09/ralph_codes
+## Usage
+
+Copy `ralph-wiggum.ts` to your `~/.config/opencode/plugin/` directory.
+
+### Automatic Mode
+
+```
+ralph_auto "Implement user authentication with JWT"
 ```
 
-See [ralph-wiggum-plugin/README.md](ralph-wiggum-plugin/README.md) for full documentation.
+### Orchestrated Mode
+
+1. `ralph_start "prompt"` - Initialize the loop
+2. `ralph_add_tasks [{id, content, dependencies?}]` - Add tasks
+3. `ralph_run` - Execute with automatic parallelization
+
+### State Management
+
+- `ralph_quit` - Save state and quit
+- `ralph_resume` - Resume from saved state
+- `ralph_status` - Check current progress
 
 ## License
 
 AGPL-3.0
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [ralph-wiggum-plugin/CONTRIBUTING.md](ralph-wiggum-plugin/CONTRIBUTING.md).
-
-## Third-Party Notices
-
-Based on the Ralph technique by [Geoff Huntley](https://ghuntley.com/ralph/).

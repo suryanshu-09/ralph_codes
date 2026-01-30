@@ -1,4 +1,6 @@
 import { type Plugin, tool } from "@opencode-ai/plugin"
+import * as fs from "fs"
+import * as path from "path"
 
 interface RalphTask {
   id: string
@@ -32,14 +34,65 @@ interface TaskWithDeps {
   outputs: string[]
 }
 
+// Ralph state file path
+const RALPH_STATE_FILE = path.join(process.env.HOME || "", ".config", "opencode", "ralph-state.json")
+
 // In-memory state
 let activeLoop: RalphLoop | null = null
 let lastKnownTodos: any[] = []
+let activeSessions: Map<string, { taskId: string; createdAt: number }> = new Map()
 
 // Default model for all ralph operations
 const DEFAULT_MODEL: ModelConfig = {
   providerID: "opencode",
-  modelID: "minimax-m2.1-free",
+  modelID: "opencode-zen-big-pickle",
+}
+
+// Save Ralph loop state to file
+const saveRalphState = (): { success: boolean; message: string; todosDone?: number } => {
+  try {
+    const stateDir = path.dirname(RALPH_STATE_FILE)
+    if (!fs.existsSync(stateDir)) {
+      fs.mkdirSync(stateDir, { recursive: true })
+    }
+
+    const completedTodos = lastKnownTodos.filter((t: any) => t.status === "completed").length
+
+    const stateData = {
+      activeLoop: activeLoop,
+      lastKnownTodos: lastKnownTodos,
+      savedAt: Date.now(),
+      todosDone: completedTodos,
+    }
+
+    fs.writeFileSync(RALPH_STATE_FILE, JSON.stringify(stateData, null, 2))
+    return { success: true, message: `State saved to ${RALPH_STATE_FILE}`, todosDone: completedTodos }
+  } catch (e) {
+    return { success: false, message: `Failed to save state: ${e instanceof Error ? e.message : String(e)}` }
+  }
+}
+
+// Load Ralph loop state from file
+const loadRalphState = (): { success: boolean; message: string; loadedTodosDone?: number } => {
+  try {
+    if (!fs.existsSync(RALPH_STATE_FILE)) {
+      return { success: false, message: "No saved state found" }
+    }
+
+    const data = fs.readFileSync(RALPH_STATE_FILE, "utf-8")
+    const stateData = JSON.parse(data)
+
+    activeLoop = stateData.activeLoop || null
+    lastKnownTodos = stateData.lastKnownTodos || []
+
+    return {
+      success: true,
+      message: `State loaded from ${RALPH_STATE_FILE}`,
+      loadedTodosDone: stateData.todosDone || 0,
+    }
+  } catch (e) {
+    return { success: false, message: `Failed to load state: ${e instanceof Error ? e.message : String(e)}` }
+  }
 }
 
 // Parse model string "provider/model" into ModelConfig
@@ -215,6 +268,9 @@ export const RalphWiggumPlugin: Plugin = async ({ client }) => {
       }
       task.sessionId = session.id
       task.status = "in_progress"
+      
+      // Track this active session
+      activeSessions.set(session.id, { taskId: task.id, createdAt: Date.now() })
 
       // Strict worker prompt that enforces boundaries
       const workerPrompt = `# SINGLE TASK EXECUTION - STRICT BOUNDARIES
@@ -262,6 +318,11 @@ Start working on your task now. Remember: ONLY this task, nothing more.`
     } catch (e) {
       task.status = "failed"
       task.error = e instanceof Error ? e.message : String(e)
+    } finally {
+      // Untrack this session regardless of outcome
+      if (task.sessionId) {
+        activeSessions.delete(task.sessionId)
+      }
     }
   }
 
@@ -417,8 +478,9 @@ Now break down the request into atomic tasks with dependencies:
         args: {
           prompt: tool.schema.string().describe("The complex task to break down and execute"),
           model: tool.schema.string().optional().describe("Model to use (format: provider/model). Defaults to current session's model."),
+          serial: tool.schema.boolean().optional().describe("Execute tasks serially instead of in parallel (reduces API call frequency). Default: false"),
         },
-        async execute({ prompt, model }, ctx) {
+        async execute({ prompt, model, serial }, ctx) {
           let modelConfig: ModelConfig
           
           if (model) {
@@ -428,12 +490,14 @@ Now break down the request into atomic tasks with dependencies:
           }
 
           const modelInfo = `${modelConfig.providerID}/${modelConfig.modelID}`
+          const executeSerial = serial === true
 
           const results: string[] = []
           results.push(`Ralph Auto-Loop Starting`)
           results.push(`=========================`)
           results.push(`Prompt: "${prompt}"`)
           results.push(`Model: ${modelInfo}`)
+          results.push(`Mode: ${executeSerial ? "SERIAL (one task at a time)" : "PARALLEL (max concurrency)"}`)
           results.push(``)
 
           // Step 1: Break down the prompt into tasks with dependencies
@@ -478,26 +542,19 @@ Now break down the request into atomic tasks with dependencies:
           // Step 3: Build execution layers for parallelization
           const layers = buildExecutionLayers(loop.tasks)
           
-          results.push(`Step 2: Executing tasks (${layers.length} parallel layers)...`)
+          results.push(`Step 2: Executing tasks${executeSerial ? " serially" : ` (${layers.length} parallel layers)`}...`)
           results.push(``)
 
           let taskCounter = 0
-          for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
-            const layer = layers[layerIdx]
-            const parallelCount = layer.length
-            
-            results.push(`=== Layer ${layerIdx + 1}/${layers.length} (${parallelCount} task${parallelCount > 1 ? "s in parallel" : ""}) ===`)
-            
-            if (parallelCount > 1) {
-              results.push(`Running ${parallelCount} tasks in PARALLEL...`)
-            }
-
-            // Execute layer tasks in parallel
-            await executeTasksParallel(layer, loop, taskCounter, loop.tasks.length)
-
-            // Report results for this layer
-            for (const task of layer) {
+          
+          if (executeSerial) {
+            // Serial execution: one task at a time
+            for (const task of loop.tasks) {
               taskCounter++
+              results.push(`=== Task ${taskCounter}/${loop.tasks.length} (serial) ===`)
+              
+              await executeTask(task, loop, taskCounter, loop.tasks.length)
+              
               results.push(``)
               results.push(`--- Task ${taskCounter}/${loop.tasks.length} ---`)
               results.push(`Task: ${task.content}`)
@@ -509,8 +566,40 @@ Now break down the request into atomic tasks with dependencies:
                 results.push(`Session: ${task.sessionId || "N/A"}`)
                 results.push(`Status: FAILED - ${task.error || "Unknown error"}`)
               }
+              results.push(``)
             }
-            results.push(``)
+          } else {
+            // Parallel execution: layer by layer
+            for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
+              const layer = layers[layerIdx]
+              const parallelCount = layer.length
+              
+              results.push(`=== Layer ${layerIdx + 1}/${layers.length} (${parallelCount} task${parallelCount > 1 ? "s in parallel" : ""}) ===`)
+              
+              if (parallelCount > 1) {
+                results.push(`Running ${parallelCount} tasks in PARALLEL...`)
+              }
+
+              // Execute layer tasks in parallel
+              await executeTasksParallel(layer, loop, taskCounter, loop.tasks.length)
+
+              // Report results for this layer
+              for (const task of layer) {
+                taskCounter++
+                results.push(``)
+                results.push(`--- Task ${taskCounter}/${loop.tasks.length} ---`)
+                results.push(`Task: ${task.content}`)
+                
+                if (task.status === "completed") {
+                  results.push(`Session: ${task.sessionId}`)
+                  results.push(`Status: COMPLETED`)
+                } else {
+                  results.push(`Session: ${task.sessionId || "N/A"}`)
+                  results.push(`Status: FAILED - ${task.error || "Unknown error"}`)
+                }
+              }
+              results.push(``)
+            }
           }
 
           loop.running = false
@@ -524,7 +613,7 @@ Now break down the request into atomic tasks with dependencies:
           results.push(`=========================`)
           results.push(`Completed: ${completedCount}/${loop.tasks.length}`)
           if (failedCount > 0) results.push(`Failed: ${failedCount}`)
-          results.push(`Parallel layers used: ${layers.length}`)
+          results.push(`Execution mode: ${executeSerial ? "serial" : `parallel (${layers.length} layers)`}`)
           results.push(``)
           results.push(`Sessions created:`)
           loop.tasks.forEach((t, i) => {
@@ -573,7 +662,7 @@ Now break down the request into atomic tasks with dependencies:
 
 ## Model
 Worker sessions will use: ${modelInfo}
-${model ? "(explicitly specified)" : "(default: opencode/minimax-m2.1-free)"}
+${model ? "(explicitly specified)" : "(default: opencode/opencode-zen-big-pickle)"}
 
 ## Next Steps (you are the orchestrator)
 1. Use \`ralph_add_tasks\` to add ATOMIC tasks with dependencies
@@ -638,8 +727,10 @@ Call \`ralph_run\` to start executing. Independent tasks will run in parallel!`
 
       ralph_run: tool({
         description: "Run the Ralph loop - executes tasks with automatic parallelization based on dependencies. Independent tasks run in parallel, dependent tasks wait for their dependencies.",
-        args: {},
-        async execute(args, ctx) {
+        args: {
+          serial: tool.schema.boolean().optional().describe("Execute tasks serially instead of in parallel (reduces API call frequency). Default: false"),
+        },
+        async execute({ serial }, ctx) {
           if (!activeLoop) {
             return "Error: No active Ralph loop. Call ralph_start first."
           }
@@ -697,34 +788,28 @@ Tasks 2 and 3 will run in PARALLEL since they have no dependencies on each other
           }
 
           const results: string[] = []
+          const executeSerial = serial === true
           
           // Build execution layers
           const layers = buildExecutionLayers(activeLoop.tasks.filter(t => t.status === "pending"))
           
           results.push(`Starting Ralph loop with ${pendingTasks.length} pending tasks...`)
-          results.push(`Execution plan: ${layers.length} layers with parallelization\n`)
+          results.push(`Execution mode: ${executeSerial ? "serial (one task at a time)" : `parallel (${layers.length} layers)`}\n`)
 
           const loop = activeLoop
           loop.running = true
 
           let taskCounter = 0
-          for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
-            const layer = layers[layerIdx]
-            const parallelCount = layer.length
-            
-            results.push(`\n=== Layer ${layerIdx + 1}/${layers.length} (${parallelCount} task${parallelCount > 1 ? "s in parallel" : ""}) ===`)
-            
-            if (parallelCount > 1) {
-              results.push(`Executing ${parallelCount} tasks in PARALLEL...`)
-            }
-
-            // Execute layer tasks in parallel
-            await executeTasksParallel(layer, loop, taskCounter, loop.tasks.length)
-
-            // Report results for this layer
-            for (const task of layer) {
+          
+          if (executeSerial) {
+            // Serial execution: one task at a time
+            for (const task of pendingTasks) {
               taskCounter++
-              results.push(`\n--- Task ${taskCounter}/${loop.tasks.length} ---`)
+              results.push(`\n=== Task ${taskCounter}/${pendingTasks.length} (serial) ===`)
+              
+              await executeTask(task, loop, taskCounter, loop.tasks.length)
+              
+              results.push(`\n--- Task ${taskCounter}/${pendingTasks.length} ---`)
               results.push(`Task: ${task.content}`)
               
               if (task.status === "completed") {
@@ -733,6 +818,36 @@ Tasks 2 and 3 will run in PARALLEL since they have no dependencies on each other
               } else {
                 results.push(`Session: ${task.sessionId || "N/A"}`)
                 results.push(`Status: FAILED - ${task.error || "Unknown error"}`)
+              }
+            }
+          } else {
+            // Parallel execution: layer by layer
+            for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
+              const layer = layers[layerIdx]
+              const parallelCount = layer.length
+              
+              results.push(`\n=== Layer ${layerIdx + 1}/${layers.length} (${parallelCount} task${parallelCount > 1 ? "s in parallel" : ""}) ===`)
+              
+              if (parallelCount > 1) {
+                results.push(`Executing ${parallelCount} tasks in PARALLEL...`)
+              }
+
+              // Execute layer tasks in parallel
+              await executeTasksParallel(layer, loop, taskCounter, loop.tasks.length)
+
+              // Report results for this layer
+              for (const task of layer) {
+                taskCounter++
+                results.push(`\n--- Task ${taskCounter}/${loop.tasks.length} ---`)
+                results.push(`Task: ${task.content}`)
+                
+                if (task.status === "completed") {
+                  results.push(`Session: ${task.sessionId}`)
+                  results.push(`Status: COMPLETED`)
+                } else {
+                  results.push(`Session: ${task.sessionId || "N/A"}`)
+                  results.push(`Status: FAILED - ${task.error || "Unknown error"}`)
+                }
               }
             }
           }
@@ -745,7 +860,7 @@ Tasks 2 and 3 will run in PARALLEL since they have no dependencies on each other
           results.push(`\n--- Ralph Loop Complete ---`)
           results.push(`Completed: ${completedCount}/${loop.tasks.length}`)
           if (failedCount > 0) results.push(`Failed: ${failedCount}`)
-          results.push(`Parallel execution layers: ${layers.length}`)
+          results.push(`Execution mode: ${executeSerial ? "serial" : `parallel (${layers.length} layers)`}`)
           results.push(`\n<ralph_done>Processed ${loop.tasks.length} tasks</ralph_done>`)
 
           activeLoop = null
@@ -754,39 +869,233 @@ Tasks 2 and 3 will run in PARALLEL since they have no dependencies on each other
       }),
 
       ralph_status: tool({
-        description: "Check the status of the current Ralph loop",
+        description: "Check the status of the current Ralph loop or saved checkpoint",
         args: {},
         async execute(args, ctx) {
-          if (!activeLoop) {
-            return "No active Ralph loop."
-          }
+          // Helper to format a RalphLoop for display
+          const formatLoop = (loop: RalphLoop, label: string) => {
+            const pending = loop.tasks.filter(t => t.status === "pending").length
+            const inProgress = loop.tasks.filter(t => t.status === "in_progress").length
+            const completed = loop.tasks.filter(t => t.status === "completed").length
+            const failed = loop.tasks.filter(t => t.status === "failed").length
 
-          const pending = activeLoop.tasks.filter(t => t.status === "pending").length
-          const inProgress = activeLoop.tasks.filter(t => t.status === "in_progress").length
-          const completed = activeLoop.tasks.filter(t => t.status === "completed").length
-          const failed = activeLoop.tasks.filter(t => t.status === "failed").length
-          
-          const modelInfo = activeLoop.model 
-            ? `${activeLoop.model.providerID}/${activeLoop.model.modelID}`
-            : `${DEFAULT_MODEL.providerID}/${DEFAULT_MODEL.modelID}`
+            const modelInfo = loop.model
+              ? `${loop.model.providerID}/${loop.model.modelID}`
+              : `${DEFAULT_MODEL.providerID}/${DEFAULT_MODEL.modelID}`
 
-          // Show parallelization info
-          const pendingTasks = activeLoop.tasks.filter(t => t.status === "pending")
-          const layers = pendingTasks.length > 0 ? buildExecutionLayers(pendingTasks) : []
+            const pendingTasks = loop.tasks.filter(t => t.status === "pending")
+            const layers = pendingTasks.length > 0 ? buildExecutionLayers(pendingTasks) : []
 
-          return `Ralph Loop: ${activeLoop.id}
-Prompt: "${activeLoop.originalPrompt}"
+            return `${label}
+Loop ID: ${loop.id}
+Prompt: "${loop.originalPrompt}"
 Model: ${modelInfo}
-Running: ${activeLoop.running ? "YES" : "NO"}
-Progress: ${completed}/${activeLoop.tasks.length} (${pending} pending, ${inProgress} in progress, ${failed} failed)
+Running: ${loop.running ? "YES" : "NO"}
+Progress: ${completed}/${loop.tasks.length} (${pending} pending, ${inProgress} in progress, ${failed} failed)
+Saved: ${new Date(loop.createdAt).toLocaleString()}
 
 Tasks:
-${activeLoop.tasks.length > 0 ? activeLoop.tasks.map((t, i) => {
+${loop.tasks.length > 0 ? loop.tasks.map((t, i) => {
   const deps = t.dependencies && t.dependencies.length > 0 ? ` [depends: ${t.dependencies.join(", ")}]` : ""
   return `  ${i + 1}. [${t.status}] ${t.content}${deps}${t.sessionId ? ` (session: ${t.sessionId})` : ""}${t.error ? ` - Error: ${t.error}` : ""}`
 }).join("\n") : "  (no tasks added yet)"}
 
 ${layers.length > 0 ? `\nRemaining Execution Layers:\n${layers.map((layer, i) => `  Layer ${i + 1}: ${layer.map(t => t.id).join(", ")} ${layer.length > 1 ? "(PARALLEL)" : ""}`).join("\n")}` : ""}`
+          }
+
+          // Show active loop if one exists
+          if (activeLoop) {
+            // Show active sessions if any
+            if (activeSessions.size > 0) {
+              results.push(`=== Active Ralph Loop ===`)
+              results.push(`Loop ID: ${activeLoop.id}`)
+              results.push(`Prompt: "${activeLoop.originalPrompt}"`)
+              results.push(`Running: YES`)
+              results.push(`Progress: ${completed}/${activeLoop.tasks.length} (${pending} pending, ${inProgress} in progress, ${failed} failed)`)
+              results.push(``)
+              results.push(`Active Sessions (${activeSessions.size}):`)
+              for (const [sessionId, info] of activeSessions) {
+                const task = activeLoop.tasks.find(t => t.id === info.taskId)
+                results.push(`  - ${sessionId}`)
+                results.push(`    Task: ${task?.content || info.taskId}`)
+                results.push(`    Started: ${new Date(info.createdAt).toLocaleTimeString()}`)
+              }
+              return results.join("\n")
+            }
+            return formatLoop(activeLoop, "=== Active Ralph Loop ===")
+          }
+
+          // Check for saved checkpoint
+          if (fs.existsSync(RALPH_STATE_FILE)) {
+            try {
+              const data = fs.readFileSync(RALPH_STATE_FILE, "utf-8")
+              const stateData = JSON.parse(data)
+
+              if (stateData.activeLoop) {
+                const savedAt = stateData.savedAt ? new Date(stateData.savedAt).toLocaleString() : "unknown"
+                const todosDone = stateData.todosDone || 0
+
+                return `=== Saved Ralph Checkpoint ===
+Saved: ${savedAt}
+Todos completed before save: ${todosDone}
+
+${formatLoop(stateData.activeLoop, "")}
+
+---
+Use \`ralph_resume\` to restore this checkpoint and continue.`
+              }
+            } catch (e) {
+              // Fall through to no loop message
+            }
+          }
+
+          return "No active Ralph loop and no saved checkpoint found."
+        },
+      }),
+
+      ralph_quit: tool({
+        description: "Save the current Ralph loop state and quit. Optionally execute pre/post instructions. Saves task progress and todo completion count. Shows live update of completed work before saving.",
+        args: {
+          pre: tool.schema.string().optional().describe("Pre-quit instruction to execute before saving state"),
+          post: tool.schema.string().optional().describe("Post-quit instruction to execute after saving state"),
+        },
+        async execute({ pre, post }, ctx) {
+          const results: string[] = []
+
+          if (pre) {
+            results.push(`Pre-quit instruction: ${pre}`)
+          }
+
+          // Generate live update of current progress
+          if (activeLoop) {
+            const completed = activeLoop.tasks.filter(t => t.status === "completed")
+            const inProgress = activeLoop.tasks.filter(t => t.status === "in_progress")
+            const pending = activeLoop.tasks.filter(t => t.status === "pending")
+            const failed = activeLoop.tasks.filter(t => t.status === "failed")
+
+            results.push(``)
+            results.push(`=== Live Progress Update ===`)
+            results.push(`Progress: ${completed.length}/${activeLoop.tasks.length} tasks completed`)
+            results.push(``)
+
+            if (completed.length > 0) {
+              results.push(`Completed (${completed.length}):`)
+              completed.forEach((t, i) => {
+                results.push(`  ${i + 1}. ${t.content}`)
+                if (t.sessionId) results.push(`     Session: ${t.sessionId}`)
+              })
+            }
+
+            if (inProgress.length > 0) {
+              results.push(``)
+              results.push(`In Progress (${inProgress.length}):`)
+              inProgress.forEach((t, i) => {
+                results.push(`  ${i + 1}. ${t.content}`)
+                if (t.sessionId) results.push(`     Session: ${t.sessionId}`)
+              })
+            }
+
+            if (pending.length > 0) {
+              results.push(``)
+              results.push(`Pending (${pending.length}):`)
+              pending.slice(0, 5).forEach((t, i) => {
+                results.push(`  ${i + 1}. ${t.content}`)
+              })
+              if (pending.length > 5) {
+                results.push(`  ... and ${pending.length - 5} more`)
+              }
+            }
+
+            if (failed.length > 0) {
+              results.push(``)
+              results.push(`Failed (${failed.length}):`)
+              failed.forEach((t, i) => {
+                results.push(`  ${i + 1}. ${t.content}`)
+                if (t.error) results.push(`     Error: ${t.error}`)
+              })
+            }
+
+            // Report active sessions that will continue running
+            if (activeSessions.size > 0) {
+              results.push(``)
+              results.push(`⚠️  Active Sessions (${activeSessions.size} still running):`)
+              for (const [sessionId, info] of activeSessions) {
+                const task = activeLoop.tasks.find(t => t.id === info.taskId)
+                results.push(`  - Session: ${sessionId}`)
+                results.push(`    Task: ${task?.content || info.taskId}`)
+                results.push(`    Started: ${new Date(info.createdAt).toLocaleTimeString()}`)
+              }
+              results.push(``)
+              results.push(`Note: Running sessions will continue in background. State saved includes all progress.`)
+            }
+          }
+
+          const saveResult = saveRalphState()
+          
+          if (!saveResult.success) {
+            return `Failed to save state: ${saveResult.message}`
+          }
+
+          const loopInfo = activeLoop 
+            ? `Loop: ${activeLoop.id}\nPrompt: "${activeLoop.originalPrompt}"\nTasks: ${activeLoop.tasks.length}`
+            : "No active loop"
+
+          results.push(``)
+          results.push(`=== State Saved ===`)
+          results.push(`Ralph loop state saved.`)
+          results.push(`Todos completed: ${saveResult.todosDone}`)
+          results.push(loopInfo)
+          results.push(`State saved to: ${RALPH_STATE_FILE}`)
+          results.push(``)
+          results.push(`Use \`ralph_resume\` to restore and continue from this point.`)
+
+          if (post) {
+            results.push(`Post-quit instruction: ${post}`)
+          }
+
+          activeLoop = null
+          return results.join("\n")
+        },
+      }),
+
+      ralph_resume: tool({
+        description: "Resume a previously saved Ralph loop state. Optionally execute pre/post instructions.",
+        args: {
+          pre: tool.schema.string().optional().describe("Pre-resume instruction to execute before loading state"),
+          post: tool.schema.string().optional().describe("Post-resume instruction to execute after loading state"),
+        },
+        async execute({ pre, post }, ctx) {
+          const results: string[] = []
+
+          if (pre) {
+            results.push(`Pre-resume instruction: ${pre}`)
+          }
+
+          const loadResult = loadRalphState()
+          
+          if (!loadResult.success) {
+            return `Failed to resume: ${loadResult.message}`
+          }
+
+          if (!activeLoop) {
+            return "No loop found in saved state"
+          }
+
+          const completed = activeLoop.tasks.filter(t => t.status === "completed").length
+          const pending = activeLoop.tasks.filter(t => t.status === "pending").length
+          const failed = activeLoop.tasks.filter(t => t.status === "failed").length
+
+          results.push(`Ralph loop state loaded.`)
+          results.push(`Previously completed todos: ${loadResult.loadedTodosDone}`)
+          results.push(`Loop: ${activeLoop.id}`)
+          results.push(`Prompt: "${activeLoop.originalPrompt}"`)
+          results.push(`Progress: ${completed}/${activeLoop.tasks.length} (${pending} pending, ${failed} failed)`)
+
+          if (post) {
+            results.push(`Post-resume instruction: ${post}`)
+          }
+
+          return results.join("\n")
         },
       }),
 
@@ -803,7 +1112,7 @@ Based on: https://ghuntley.com/ralph/
 Use \`ralph_auto\` for fully automatic execution:
 - Breaks down your prompt into ATOMIC tasks automatically
 - Analyzes dependencies between tasks
-- Executes INDEPENDENT tasks in PARALLEL
+- Executes INDEPENDENT tasks in PARALLEL (or serially with --serial)
 - No further interaction needed
 
 Example:
@@ -813,7 +1122,18 @@ Example:
 Use the traditional multi-step approach:
 1. ralph_start "prompt" - Initialize the loop
 2. ralph_add_tasks [...] - Add tasks with dependencies
-3. ralph_run - Execute (parallel where possible)
+3. ralph_run - Execute (parallel where possible, or serial with --serial)
+
+## Serial Execution
+
+Use the --serial flag to execute tasks one at a time instead of in parallel:
+- Reduces API call frequency (useful for rate-limited APIs)
+- Tasks still respect dependency order
+- Slower but gentler on resources
+
+Example:
+  ralph_auto "Build a blog" --serial
+  ralph_run --serial
 
 ## Parallelization
 
@@ -844,19 +1164,37 @@ Workers are instructed to:
 - STOP when their task is done
 
 ## Model Selection
-Default model: opencode/minimax-m2.1-free
+Default model: opencode/opencode-zen-big-pickle
 Override with: ralph_auto "task" --model "anthropic/claude-opus-4-5-20250929"
 
 ## CLI Usage (Headless)
   opencode run "Use ralph_auto to implement feature X"
+  opencode run "Use ralph_auto with --serial to implement feature X"
 
 ## Tools
-- ralph_auto "prompt" - Automatic breakdown + parallel execution
+- ralph_auto "prompt" [--serial] - Automatic breakdown + execution (parallel by default)
 - ralph_start "prompt" - Initialize manual loop
 - ralph_add_tasks [{id, content, dependencies?}, ...] - Add tasks
-- ralph_run - Execute with automatic parallelization
+- ralph_run [--serial] - Execute tasks (parallel by default)
 - ralph_status - Check progress
-- ralph_help - This help`
+- ralph_quit [--pre "instruction"] [--post "instruction"] - Save state and quit
+- ralph_resume [--pre "instruction"] [--post "instruction"] - Resume saved state
+- ralph_help - This help
+
+## Session State (ralph_quit / ralph_resume)
+
+Save your progress and resume later:
+
+1. Start a loop: \`ralph_start "task"\`
+2. Add tasks and run some: \`ralph_add_tasks [...]\` then \`ralph_run\`
+3. Save state and quit: \`ralph_quit\`
+4. Resume later: \`ralph_resume\`
+
+Both commands support optional pre/post instructions:
+- \`ralph_quit --pre "Check git status" --post "Notify team"\`
+- \`ralph_resume --pre "Review previous work" --post "Continue implementation"\`
+
+State is saved to: ~/.config/opencode/ralph-state.json`
         },
       }),
     },
