@@ -45,7 +45,7 @@ let activeSessions: Map<string, { taskId: string; createdAt: number }> = new Map
 // Default model for all ralph operations
 const DEFAULT_MODEL: ModelConfig = {
   providerID: "opencode",
-  modelID: "opencode-zen-big-pickle",
+  modelID: "big-pickle",
 }
 
 // Save Ralph loop state to file
@@ -662,7 +662,7 @@ Now break down the request into atomic tasks with dependencies:
 
 ## Model
 Worker sessions will use: ${modelInfo}
-${model ? "(explicitly specified)" : "(default: opencode/opencode-zen-big-pickle)"}
+${model ? "(explicitly specified)" : "(default: opencode/big-pickle)"}
 
 ## Next Steps (you are the orchestrator)
 1. Use \`ralph_add_tasks\` to add ATOMIC tasks with dependencies
@@ -1164,7 +1164,7 @@ Workers are instructed to:
 - STOP when their task is done
 
 ## Model Selection
-Default model: opencode/opencode-zen-big-pickle
+Default model: opencode/big-pickle
 Override with: ralph_auto "task" --model "anthropic/claude-opus-4-5-20250929"
 
 ## CLI Usage (Headless)
